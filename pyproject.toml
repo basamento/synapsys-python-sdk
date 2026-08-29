@@ -1,0 +1,72 @@
+[build-system]
+# Hatchling 1.32 emits Core Metadata 2.5, which PyPI/Twine do not yet accept.
+requires = ["hatchling>=1.27,<1.32"]
+build-backend = "hatchling.build"
+
+[project]
+name = "basamento-synapsys"
+version = "0.1.0"
+description = "Register Python applications as Synapsys workers and run their processes remotely."
+readme = "README.md"
+requires-python = ">=3.9"
+license = "Apache-2.0"
+license-files = ["LICENSE", "NOTICE"]
+authors = [
+  { name = "Julian Marzoli", email = "admin@basamento.org" },
+]
+keywords = [
+  "synapsys",
+  "worker",
+  "background-jobs",
+  "control-plane",
+  "heartbeat",
+  "process-management",
+]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Intended Audience :: Developers",
+  "Operating System :: OS Independent",
+  "Programming Language :: Python :: 3 :: Only",
+  "Programming Language :: Python :: 3.9",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Topic :: Software Development :: Libraries :: Python Modules",
+  "Typing :: Typed",
+]
+dependencies = []
+
+[project.optional-dependencies]
+dev = [
+  "build>=1.2,<2",
+  "mypy>=1.14,<2",
+  "pytest>=8.3,<9",
+  "ruff>=0.9,<1",
+  "twine>=6,<7",
+]
+
+[project.urls]
+Homepage = "https://github.com/basamento/synapsys-python-sdk"
+Repository = "https://github.com/basamento/synapsys-python-sdk.git"
+Issues = "https://github.com/basamento/synapsys-python-sdk/issues"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/basamento_synapsys"]
+
+[tool.pytest.ini_options]
+addopts = "-ra"
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py39"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM"]
+
+[tool.mypy]
+python_version = "3.9"
+strict = true
+packages = ["basamento_synapsys"]
+mypy_path = "src"
