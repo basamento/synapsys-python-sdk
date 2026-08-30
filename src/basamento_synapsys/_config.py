@@ -23,6 +23,7 @@ _OPTION_NAMES = (
     "fail_fast",
     "connect_timeout",
     "request_timeout",
+    "shutdown_timeout",
     "capture_console",
     "log_level",
     "logger",
@@ -38,6 +39,7 @@ _ENV_NAMES = {
     "fail_fast": "SYNAPSYS_FAIL_FAST",
     "connect_timeout": "SYNAPSYS_CONNECT_TIMEOUT",
     "request_timeout": "SYNAPSYS_REQUEST_TIMEOUT",
+    "shutdown_timeout": "SYNAPSYS_SHUTDOWN_TIMEOUT",
     "capture_console": "SYNAPSYS_CAPTURE_CONSOLE",
     "log_level": "SYNAPSYS_LOG_LEVEL",
 }
@@ -54,6 +56,7 @@ class Config:
     fail_fast: bool
     connect_timeout: float
     request_timeout: float
+    shutdown_timeout: float
     capture_console: bool
     log_level: str
     logger: Any
@@ -68,6 +71,7 @@ class Config:
             "fail_fast": self.fail_fast,
             "connect_timeout": self.connect_timeout,
             "request_timeout": self.request_timeout,
+            "shutdown_timeout": self.shutdown_timeout,
             "capture_console": self.capture_console,
             "log_level": self.log_level,
         }
@@ -110,6 +114,7 @@ def resolve_config(options: Mapping[str, Any], env: Mapping[str, str] | None = N
         fail_fast=_boolean(raw("fail_fast", False), "fail_fast"),
         connect_timeout=parse_duration(raw("connect_timeout", "2s"), "connect_timeout"),
         request_timeout=parse_duration(raw("request_timeout", "5s"), "request_timeout"),
+        shutdown_timeout=parse_duration(raw("shutdown_timeout", "10s"), "shutdown_timeout"),
         capture_console=_boolean(raw("capture_console", True), "capture_console"),
         log_level=_log_level(raw("log_level", "info")),
         logger=raw("logger", None),

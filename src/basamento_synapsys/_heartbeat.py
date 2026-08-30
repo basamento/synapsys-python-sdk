@@ -10,7 +10,7 @@ from ._capture import LogCapture
 from ._config import Config
 from ._http import HttpClient
 from ._log import SynapsysLogger
-from ._process import ManagedProcess, _Command
+from ._process import ManagedProcess, _Command, _Outcome
 
 FRAMEWORK = "python"
 MAX_LOG_ENTRIES_PER_BEAT = 100
@@ -64,7 +64,7 @@ class HeartbeatLoop:
             thread.join(timeout)
         self._thread = None
 
-    def tick(self) -> None:
+    def tick(self, *, apply_commands: bool = True) -> None:
         logs: list[dict[str, Any]] = []
         if self._capture is not None:
             logs = self._capture.drain(MAX_LOG_ENTRIES_PER_BEAT, MAX_LOG_BYTES_PER_BEAT)
@@ -93,10 +93,39 @@ class HeartbeatLoop:
             )
             return
 
+        # A 2xx whose body is not a readable HeartbeatResponse is a protocol failure
+        # rather than a quiet success: Core's contract makes ``processes`` required,
+        # so an empty or unreadable body means this beat delivered no commands.
+        # Treating it as success would acknowledge nothing and drop the drained logs.
+        body = response.body
+        if body is None or not isinstance(body.get("processes"), list):
+            self._requeue(logs)
+            self._mark_unavailable("Core returned a malformed heartbeat response", None)
+            return
+
         self._mark_available()
-        self._apply_commands(response.body)
+        if apply_commands:
+            self._apply_commands(body)
+
+    def final_tick(self) -> bool:
+        """Send one best-effort snapshot at shutdown.
+
+        The response is deliberately not applied: shutdown must never start new work.
+        A failure is diagnostic only and never propagates, so a transport problem
+        cannot fail or extend the host application's shutdown.
+        """
+        try:
+            self.tick(apply_commands=False)
+            return True
+        except BaseException as error:
+            self._logger.debug("Final heartbeat failed", error)
+            return False
 
     def _run(self) -> None:
+        # A fixed *delay*, not a fixed rate: the next beat is scheduled only once the
+        # previous one has settled, so beats cannot overlap and a Core that answers
+        # slower than one interval delays the loop rather than queueing a catch-up
+        # burst against a service that has just recovered.
         while not self._stop_event.is_set():
             try:
                 self.tick()
@@ -131,18 +160,35 @@ class HeartbeatLoop:
         decision = process.accept_command(
             update.get("desiredState"), update.get("desiredToken"), update.get("runId")
         )
+        outcome = _Outcome.HANDLED
         if decision.command is _Command.START:
             self._logger.info(
                 f"Starting process '{process.name}' (type={process.type.value}, "
                 f"token={decision.token}, runId={decision.run_id})"
             )
-            process.handle_start(decision.run_id)
+            if decision.run_id is None:
+                self._logger.warning(
+                    f"Core started process '{process.name}' without a run id | its "
+                    "console output cannot be attached to this run"
+                )
+            outcome = process.handle_start(decision.run_id)
         elif decision.command is _Command.STOP:
             self._logger.info(
                 f"Stopping process '{process.name}' (type={process.type.value}, "
                 f"token={decision.token})"
             )
-            process.handle_stop()
+            outcome = process.handle_stop()
+
+        if outcome is _Outcome.DEFERRED:
+            # Leaving the token unacknowledged is the whole mechanism: Core
+            # redelivers the same command on a later beat and it is applied once
+            # this run is terminal. Acknowledging a deferred start as a no-op would
+            # tell Core the run happened when nothing ran.
+            self._logger.debug(
+                f"Deferring command for process '{process.name}' "
+                f"(token={decision.token}) until the current execution finishes"
+            )
+            return
         process.acknowledge(decision.token)
 
     def _requeue(self, logs: list[dict[str, Any]]) -> None:

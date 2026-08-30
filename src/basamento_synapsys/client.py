@@ -12,6 +12,7 @@ from typing import Any, Callable, TypeVar, overload
 
 from ._capture import LogCapture
 from ._config import resolve_config, validate_for_startup
+from ._duration import parse_duration
 from ._heartbeat import HeartbeatLoop
 from ._http import HttpClient
 from ._log import SynapsysLogger
@@ -216,8 +217,28 @@ class Synapsys:
                     process.set_asyncio_loop(None)
             raise
 
-    def stop(self) -> Synapsys:
-        """Stop heartbeats and processes; idempotent and non-throwing."""
+    def stop(self, timeout: float | str | None = None) -> Synapsys:
+        """Shut the worker down cooperatively, within a bounded budget.
+
+        In order:
+
+        1. the heartbeat loop stops, and no further beat can start;
+        2. every running process is asked to stop;
+        3. the worker waits up to ``shutdown_timeout`` (or ``timeout``) for them to
+           become terminal;
+        4. **one** best-effort final heartbeat carries the final states and any
+           queued logs, and the commands in its response are ignored, because
+           shutdown must never start new work;
+        5. console capture is uninstalled.
+
+        Business logic that ignores its :class:`StopSignal` is never killed: Python
+        cannot safely terminate a thread. Such a process is reported by name, left
+        running, and kept observed, so no replacement execution can overlap it. The
+        application owns the decision to wait longer or exit.
+
+        Idempotent and non-throwing. A second call while the first is still running
+        returns immediately rather than starting a second teardown.
+        """
         with self._lock:
             if self._stopping:
                 return self
@@ -226,9 +247,19 @@ class Synapsys:
             capture = self._capture
             was_started = self._started
 
+        budget = (
+            self._config.shutdown_timeout
+            if timeout is None
+            else parse_duration(timeout, "stop() timeout")
+        )
+        deadline = time.monotonic() + budget
+
         try:
+            # 1. No further beats. Done first, so the loop cannot race the final one.
             if heartbeat is not None:
-                heartbeat.stop(self._config.request_timeout + 1.0)
+                heartbeat.stop(max(0.0, min(budget, self._config.request_timeout + 1.0)))
+
+            # 2. Ask every process to stop. One that throws must not skip the others.
             for process in self._processes.values():
                 try:
                     process.handle_stop()
@@ -237,18 +268,30 @@ class Synapsys:
                         f"Could not stop process '{process.name}' during worker shutdown", error
                     )
 
-            deadline = time.monotonic() + self._config.request_timeout
+            # 3. Wait, but never past the caller's deadline.
             for process in self._processes.values():
                 remaining = max(0.0, deadline - time.monotonic())
                 if not process.settle(remaining):
                     self._logger.warning(
-                        f"Process '{process.name}' did not stop before the shutdown timeout"
+                        f"Process '{process.name}' did not stop before the shutdown timeout "
+                        "| it is still running and will not be replaced by a new execution"
                     )
+
+            # 4. One bounded, best-effort final snapshot. Skipped when the budget is
+            #    already spent, so shutdown never runs past the caller's deadline.
+            if heartbeat is not None and was_started:
+                if time.monotonic() < deadline:
+                    heartbeat.final_tick()
+                else:
+                    self._logger.debug("Shutdown budget exhausted | skipping the final heartbeat")
+
             for process in self._processes.values():
                 process.set_asyncio_loop(None)
         except BaseException as error:
             self._logger.error("Unexpected worker shutdown failure", error)
         finally:
+            # 5. Only now: everything printed during the stop sequence had a chance
+            #    to reach Core on the final beat.
             if capture is not None:
                 capture.uninstall()
             with self._lock:
@@ -262,10 +305,10 @@ class Synapsys:
                 self._logger.info("Worker stopped")
         return self
 
-    async def stop_async(self) -> Synapsys:
+    async def stop_async(self, timeout: float | str | None = None) -> Synapsys:
         """Non-blocking lifecycle exit point for future async framework adapters."""
         loop = asyncio.get_running_loop()
-        return await loop.run_in_executor(None, self.stop)
+        return await loop.run_in_executor(None, self.stop, timeout)
 
     def __enter__(self) -> Synapsys:
         return self.start()

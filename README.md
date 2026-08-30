@@ -8,12 +8,26 @@ reports them to Core on an outbound heartbeat, applies start and stop commands, 
 runs each process in an isolated thread. It never opens an inbound port and it is not
 a scheduler.
 
-## Requirements
+## Compatibility
 
-- Python 3.9 or later
-- A reachable Synapsys Core instance and a worker token
+| | |
+| --- | --- |
+| Python | 3.9 or later (tested on 3.9 – 3.13) |
+| Runtime dependencies | none |
+| Distribution name | `basamento-synapsys` |
+| Import package | `basamento_synapsys` |
+| Framework identifier sent to Core | `python` |
+| Core | any version serving `GET /api/health` and `POST /api/v1/workers/heartbeat` |
 
-The SDK has no runtime dependencies.
+You also need a reachable Synapsys Core instance and a worker token.
+
+This SDK implements the shared Synapsys client-library specification, which every
+official client library follows so that they behave like one product rather than
+several interpretations of it:
+
+- `synapsys-docs/CLIENT_LIBRARY_SPEC.md` — the normative client contract
+- `synapsys-docs/content/manuals/raw-api/checklist.md` — the wire-protocol checklist
+- `openapi.yaml` in the Core repository — the machine-readable contract
 
 ## Install
 
@@ -188,6 +202,7 @@ Constructor arguments override environment variables.
 | `fail_fast` | `SYNAPSYS_FAIL_FAST` | `False` | Fail startup when Core is unreachable. |
 | `connect_timeout` | `SYNAPSYS_CONNECT_TIMEOUT` | `"2s"` | TCP/TLS connection timeout. |
 | `request_timeout` | `SYNAPSYS_REQUEST_TIMEOUT` | `"5s"` | HTTP request I/O timeout. |
+| `shutdown_timeout` | `SYNAPSYS_SHUTDOWN_TIMEOUT` | `"10s"` | How long `stop()` waits for running processes to become terminal. |
 | `capture_console` | `SYNAPSYS_CAPTURE_CONSOLE` | `True` | Send process stdout/stderr to Core. |
 | `log_level` | `SYNAPSYS_LOG_LEVEL` | `"info"` | `debug`, `info`, `warning`, `error`, or `silent`. |
 | `logger` | — | `logging.getLogger("basamento_synapsys")` | Application logger to use. |
@@ -232,12 +247,91 @@ Disable it independently while keeping remote control active:
 synapsys = Synapsys(worker_name="billing-worker", capture_console=False)
 ```
 
+### Limits you should know about
+
+Capture works by replacing `sys.stdout` and `sys.stderr` with tees. That is an
+**interpreter-wide** change, and it comes with boundaries worth stating plainly:
+
+- **One capture at a time.** The first `Synapsys` instance to start owns the streams;
+  a second instance in the same interpreter does not replace them again.
+- **Only what goes through `sys.stdout`/`sys.stderr` is captured.** A logging handler
+  bound to the original stream object before `start()`, or one writing to a file
+  descriptor directly, bypasses the tee. `logging.basicConfig()` called *after*
+  `start()` picks the tee up; called before, it does not.
+- **Something installed on top of us is never clobbered.** On shutdown the originals
+  are restored only if `sys.stdout`/`sys.stderr` are still the tees we installed.
+- **Bounded, and drops oldest.** At most 10,000 queued lines, 16,000 characters per
+  line, and 100 entries or 96 KB of UTF-8 per heartbeat.
+- **The SDK's own log lines are never captured.** They are emitted inside a
+  suspension scope, so the library cannot feed its output back to Core or recurse.
+- **Blank lines and lines with no run id are dropped**, because Core cannot store them.
+- **Nothing is captured when `capture_console` or `enabled` is `False`**, and nothing
+  after `stop()` has restored the streams.
+
+## Lifecycle semantics
+
+Core owns the desired state; the SDK owns the transition. Every command carries a
+token, and the token is acknowledged **only after** the local handler has accepted
+it, so anything unacknowledged is redelivered on a later beat.
+
+| Situation | What happens |
+| --- | --- |
+| `desiredState: "idle"` | No outstanding command. Never a stop. |
+| A start for a process already running | Idempotent no-op, acknowledged. The active `runId` is not reassigned. |
+| A stop for a process that is not running | Idempotent no-op, acknowledged. |
+| **A start while the previous run is still stopping** | **Deferred.** Not acknowledged, and the old run's `runId` is kept. Core redelivers it; it is applied once the old run is terminal. |
+| A command handler that raises | Logged, the process is marked `failed`, the token stays unacknowledged, and the other processes on that beat are unaffected. |
+| A duplicate or stale token | Ignored. |
+
+Deferring a start is the difference between a run that happens a few seconds late
+and a run that never happens at all: acknowledging it as a no-op would tell Core the
+command was carried out when nothing ran.
+
+`running` is set **synchronously**, before the worker thread starts, so a second
+start arriving immediately after cannot observe `idle` and spawn a duplicate.
+
+## Cancellation
+
+A stop sets the run's `StopSignal`, cancels any awaited task, and — for endless
+processes — runs `on_stop` on its own thread so a slow hook cannot delay the
+commands the same beat carries for other processes.
+
+Returning from the body, or raising that run's `StopRequested` or an
+`asyncio.CancelledError` while a stop is outstanding, is a **clean stop, not a
+failure**: the process returns to `idle` and nothing is logged as an error.
+
+Nothing is ever killed. Python cannot safely terminate a thread, so a body that
+never checks `stop.requested`, never calls `stop.raise_if_requested()` and never
+waits on `stop.wait()` cannot be stopped. It is reported and left running, and no
+replacement execution can overlap it.
+
+## Shutdown
+
+`stop()` runs a bounded cooperative shutdown, in this order:
+
+1. the heartbeat loop stops, and no further beat can start;
+2. every running process is asked to stop;
+3. the SDK waits up to `shutdown_timeout` for them to become terminal;
+4. **one** best-effort final heartbeat is sent, carrying the final process states
+   and whatever log lines are still queued;
+5. console capture is uninstalled.
+
+The final heartbeat's response is **ignored**: shutdown never starts new work, even
+if Core has a start command outstanding. If it fails, or the budget is already
+exhausted, that is logged at `debug` and shutdown continues — a transport problem
+never fails or extends the host application's shutdown.
+
+Pass a different budget for one call with `stop("30s")` or `stop(30.0)`. A process
+that outlasts the budget is named in a `WARNING` and left running.
+
+`stop()` is **idempotent and non-throwing**. A second call while the first is still
+running returns immediately rather than starting a second teardown.
+
 ## Lifecycle and framework reuse
 
 Plain Python has no universal application lifecycle, so it calls `start()` once.
-`stop()` is idempotent, restores stdout/stderr, stops heartbeats, and requests that
-running processes stop. The SDK does not install operating-system signal handlers;
-the host application retains control:
+The SDK does not install operating-system signal handlers; the host application
+retains control:
 
 ```python
 try:
@@ -270,6 +364,14 @@ methods provide the corresponding seam for Django.
   host application.
 - Duplicate commands are ignored through acknowledged command tokens.
 - Core's 64-bit run IDs remain exact because Python integers have arbitrary precision.
+- Heartbeats never overlap and never burst: the next beat is scheduled only after the
+  previous one settles, so a slow Core delays the loop rather than queueing a
+  catch-up storm against a service that has just recovered.
+- A 2xx response that is not a readable heartbeat response — an empty body, or one
+  with no `processes` array — is treated as a failure. The drained log lines are
+  requeued at the front of the queue in their original order and nothing is
+  acknowledged. Unknown *fields* are still ignored: Core is versioned independently
+  of this SDK.
 
 ## Testing applications
 
